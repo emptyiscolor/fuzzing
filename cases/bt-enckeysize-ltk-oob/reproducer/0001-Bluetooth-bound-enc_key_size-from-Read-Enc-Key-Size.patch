@@ -1,0 +1,108 @@
+From: Kernel audit <littleddfu@gmail.com>
+Subject: [PATCH] Bluetooth: hci_event: bound the key size from Read Encryption Key Size
+
+hci_cc_read_enc_key_size() takes the encryption key size verbatim from a
+Command Complete event and stores it into the persistent key material:
+
+	conn->enc_key_size = rp->key_size;
+	...
+	if (conn->enc_key_size < hdev->min_enc_key_size ||
+	    (key_enc_size && conn->enc_key_size < *key_enc_size)) { ... }
+	...
+	if (key_enc_size && *key_enc_size != conn->enc_key_size)
+		*key_enc_size = conn->enc_key_size;
+
+rp->key_size is a u8 taken off the wire and both checks are downgrade
+checks, so by construction they permit arbitrarily large values.  For an
+LE link hci_conn_key_enc_size() returns &ltk->enc_size of the stored
+struct smp_ltk, whose val[] is 16 bytes.
+
+b8dbe9648d69 ("Bluetooth: MGMT: validate LTK enc_size on load") closed
+the MGMT load path to this sink by rejecting enc_size > sizeof(key->val)
+in ltk_is_valid().  That check runs at install time only, so the write
+above still reaches the same field afterwards and the same 16 byte sink
+stays open.
+
+hci_cmd_complete_evt() selects the handler purely from the opcode carried
+in the event, with no correlation against a command the host actually
+sent, so the Command Complete can be injected unsolicited by a local
+process holding /dev/vhci.  hci_read_enc_key_size() is only ever sent for
+ACL links, but the handler re-resolves the connection from an
+attacker-chosen handle and does not re-check conn->type, so an LE
+connection can be targeted.
+
+hci_le_ltk_request_evt() then consumes the corrupted field as a length:
+
+	struct hci_cp_le_ltk_reply cp;		/* 18 bytes, on the stack */
+	memcpy(cp.ltk, ltk->val, ltk->enc_size);
+	memset(cp.ltk + ltk->enc_size, 0, sizeof(cp.ltk) - ltk->enc_size);
+
+giving, with enc_size = 0xff, a 255 byte read out of a 16 byte field, a
+255 byte write into a 16 byte stack array, and a memset() whose length
+16 - 255 underflows size_t:
+
+  BUG: KASAN: slab-out-of-bounds in hci_le_ltk_request_evt+0x309/0xa00
+  Read of size 255 at addr ffff88800d06f558 by task kworker/u5:0/65
+   __asan_memcpy+0x29/0x70
+   hci_le_ltk_request_evt+0x309/0xa00
+   hci_event_packet+0x627/0xa80
+   hci_rx_work+0x31c/0x700
+  The buggy address belongs to the object at ffff88800d06f520
+   which belongs to the cache kmalloc-96 of size 96
+  The buggy address is located 56 bytes inside of
+   allocated 72-byte region
+  Allocated by task:
+   hci_add_ltk+0x175/0x310
+   load_long_term_keys+0x409/0x950
+
+  UBSAN: array-index-out-of-bounds in net/bluetooth/hci_event.c:6721:16
+  index 255 is out of range for type '__u8[16]'
+
+Reject an out of range key size before it is stored, and add
+HCI_MAX_ENC_KEY_SIZE alongside the existing HCI_MIN_ENC_KEY_SIZE.  Note
+hci_conn_key_enc_size() also returns &link_key->pin_len for ACL links,
+whose val[] is likewise 16 bytes, so the same bound covers both arms.
+
+Fixes: c82b6357a546 ("Bluetooth: hci_event: Fix not using key encryption size when its known")
+
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 3df59849dcbe..11e3d00e0f57 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -337,6 +337,11 @@ struct adv_monitor {
+ 
+ /* Min encryption key size to match with SMP */
+ #define HCI_MIN_ENC_KEY_SIZE		7
++/* Upper bound for a link encryption key size.  Both struct link_key and
++ * struct smp_ltk carry a 16 byte val[], and the stored key size is used as
++ * a memcpy() length against it.
++ */
++#define HCI_MAX_ENC_KEY_SIZE		16
+ 
+ /* Default LE RPA expiry time, 15 minutes */
+ #define HCI_DEFAULT_RPA_TIMEOUT		(15 * 60)
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index 741d658e9630..764a6e7e8fcb 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -742,6 +742,20 @@ static u8 hci_cc_read_enc_key_size(struct hci_dev *hdev, void *data,
+ 	} else {
+ 		u8 *key_enc_size = hci_conn_key_enc_size(conn);
+ 
++		/* The key size comes straight off the wire and is stored into
++		 * the persistent key material below.  ltk_is_valid() bounds it
++		 * when a key is loaded over MGMT, but that runs at install
++		 * time only, so an out of range value arriving here would be
++		 * written past it and later used as a memcpy() length against
++		 * a 16 byte buffer.  Reject it before it is stored.
++		 */
++		if (rp->key_size > HCI_MAX_ENC_KEY_SIZE) {
++			bt_dev_err(hdev, "invalid key size %u for handle %u",
++				   rp->key_size, handle);
++			status = HCI_ERROR_AUTH_FAILURE;
++			goto done;
++		}
++
+ 		conn->enc_key_size = rp->key_size;
+ 		status = 0;
+ 

@@ -1,0 +1,126 @@
+From: Kernel audit <littleddfu@gmail.com>
+Subject: [PATCH] Bluetooth: eir: bound eir_create_scan_rsp() to the caller's buffer
+
+eir_create_scan_rsp() takes no size argument, unlike its sibling
+eir_create_adv_data(struct hci_dev *hdev, u8 instance, u8 *ptr, u8 size),
+and writes up to 4 bytes of appearance followed by adv->scan_rsp_len
+bytes:
+
+	if ((adv->flags & MGMT_ADV_FLAG_APPEARANCE) && hdev->appearance)
+		scan_rsp_len = eir_append_appearance(hdev, ptr, scan_rsp_len);
+
+	memcpy(&ptr[scan_rsp_len], adv->scan_rsp_data, adv->scan_rsp_len);
+
+The destination in hci_set_ext_scan_rsp_data_sync() is a 251 byte
+flexible array on the stack:
+
+	DEFINE_FLEX(struct hci_cp_le_set_ext_scan_rsp_data, pdu, data, length,
+		    HCI_MAX_EXT_AD_LENGTH);
+
+so 4 + 251 writes past it.
+
+That combination is supposed to be unreachable, because
+tlv_data_max_len() subtracts 4 for MGMT_ADV_FLAG_APPEARANCE and so a 251
+byte scan response only validates while that flag is clear.  The flag and
+the length are set by different commands, however, and only one of them
+is reset.  hci_add_adv_instance() on an existing instance clears the scan
+response data and replaces adv->flags, while
+hci_set_adv_instance_data() assigns adv->scan_rsp_len only when the new
+length is non-zero:
+
+	if (scan_rsp_len && SCAN_RSP_CMP(adv, scan_rsp_data, scan_rsp_len)) {
+		...
+		adv->scan_rsp_len = scan_rsp_len;
+
+MGMT_OP_ADD_EXT_ADV_PARAMS passes scan_rsp_len = 0, so re-issuing it for
+an existing instance swaps in a new flags value while the previously
+validated length survives.  adv->scan_rsp_len is assigned in exactly one
+place, so it never returns to 0.
+
+Reproduced from a local process holding /dev/vhci and the MGMT socket by
+adding instance 1 with flags = 0 and a 251 byte scan response, then
+re-issuing ADD_EXT_ADV_PARAMS for the same instance with
+MGMT_ADV_FLAG_APPEARANCE, then any ADD_EXT_ADV_DATA to re-run the sync:
+
+  Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in:
+      hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0
+  Workqueue: hci0 hci_cmd_sync_work
+  Call Trace:
+   __stack_chk_fail+0x26/0x30
+   hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0
+   add_ext_adv_data_sync+0xaf/0x140
+   hci_cmd_sync_work+0x222/0x2f0
+
+Give eir_create_scan_rsp() the size argument its sibling already takes
+and bound the copy against it.
+
+Note that eir_append_local_name(), also called from this function, bounds
+itself against max_adv_len(hdev) rather than against the caller's buffer.
+That is a separate issue and is not addressed here.
+
+diff --git a/net/bluetooth/eir.c b/net/bluetooth/eir.c
+index 1de5f9df6eec..d36433f75035 100644
+--- a/net/bluetooth/eir.c
++++ b/net/bluetooth/eir.c
+@@ -342,7 +342,7 @@ static u8 create_default_scan_rsp(struct hci_dev *hdev, u8 *ptr)
+ 	return eir_append_local_name(hdev, ptr, scan_rsp_len);
+ }
+ 
+-u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr)
++u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr, u8 size)
+ {
+ 	struct adv_info *adv;
+ 	u8 scan_rsp_len = 0;
+@@ -357,6 +357,15 @@ u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr)
+ 	if ((adv->flags & MGMT_ADV_FLAG_APPEARANCE) && hdev->appearance)
+ 		scan_rsp_len = eir_append_appearance(hdev, ptr, scan_rsp_len);
+ 
++	/* adv->scan_rsp_len was validated against tlv_data_max_len() for the
++	 * flags in force when the data was set, but adv->flags can be replaced
++	 * afterwards without the length being revalidated, so the appearance
++	 * prefix above may no longer have been accounted for.  Bound the copy
++	 * against the caller's buffer.
++	 */
++	if (scan_rsp_len + adv->scan_rsp_len > size)
++		return scan_rsp_len;
++
+ 	memcpy(&ptr[scan_rsp_len], adv->scan_rsp_data, adv->scan_rsp_len);
+ 
+ 	scan_rsp_len += adv->scan_rsp_len;
+diff --git a/net/bluetooth/eir.h b/net/bluetooth/eir.h
+index 9372db83f912..1bbcc86d67f5 100644
+--- a/net/bluetooth/eir.h
++++ b/net/bluetooth/eir.h
+@@ -10,7 +10,7 @@
+ void eir_create(struct hci_dev *hdev, u8 *data);
+ 
+ u8 eir_create_adv_data(struct hci_dev *hdev, u8 instance, u8 *ptr, u8 size);
+-u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr);
++u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr, u8 size);
+ u8 eir_create_per_adv_data(struct hci_dev *hdev, u8 instance, u8 *ptr);
+ 
+ u8 eir_append_local_name(struct hci_dev *hdev, u8 *eir, u8 ad_len);
+diff --git a/net/bluetooth/hci_sync.c b/net/bluetooth/hci_sync.c
+index c8d14128c363..5816b2764894 100644
+--- a/net/bluetooth/hci_sync.c
++++ b/net/bluetooth/hci_sync.c
+@@ -1542,7 +1542,8 @@ static int hci_set_ext_scan_rsp_data_sync(struct hci_dev *hdev, u8 instance)
+ 		}
+ 	}
+ 
+-	len = eir_create_scan_rsp(hdev, instance, pdu->data);
++	len = eir_create_scan_rsp(hdev, instance, pdu->data,
++				  HCI_MAX_EXT_AD_LENGTH);
+ 
+ 	pdu->handle = adv ? adv->handle : instance;
+ 	pdu->length = len;
+@@ -1587,7 +1588,8 @@ static int __hci_set_scan_rsp_data_sync(struct hci_dev *hdev, u8 instance)
+ 	if (instance)
+ 		hci_dev_lock(hdev);
+ 
+-	len = eir_create_scan_rsp(hdev, instance, cp.data);
++	len = eir_create_scan_rsp(hdev, instance, cp.data,
++				  sizeof(cp.data));
+ 
+ 	if (instance)
+ 		hci_dev_unlock(hdev);

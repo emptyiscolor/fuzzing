@@ -1,0 +1,98 @@
+From: Kernel audit <littleddfu@gmail.com>
+Subject: [PATCH] sctp: size the ASCONF del-pickup parameter from the pending address
+
+sctp_make_asconf_update_ip() computes the chunk size in a first pass and
+fills the chunk in a second.  When asoc->asconf_addr_del_pending is set,
+the sizing pass charges the extra DEL_IP parameter using addr_param_len,
+which at that point holds the address parameter length of the address
+being walked in the caller's array:
+
+	addr_param_len = af->to_addr_param(addr, &addr_param);
+	...
+	if (asoc->asconf_addr_del_pending && !del_pickup) {
+		/* reuse the parameter length from the same scope one */
+		totallen += paramlen;
+		totallen += addr_param_len;
+
+The fill pass, however, derives the length from asconf_addr_del_pending's
+own address family:
+
+	addr = asoc->asconf_addr_del_pending;
+	af = sctp_get_af_specific(addr->v4.sin_family);
+	addr_param_len = af->to_addr_param(addr, &addr_param);
+
+The comment states an assumption ("the same scope one") that nothing
+enforces.  A pending-delete IPv6 address contributes a 20-byte address
+parameter while IPv4 additions contribute 8, so the chunk is
+under-reserved by 12 bytes and sctp_addto_chunk() writes past the
+reservation, tripping skb_over_panic():
+
+  kernel BUG at net/core/skbuff.c:214!
+  RIP: 0010:skb_over_panic+0x14f/0x160
+  Call Trace:
+   skb_put+0x110/0x1f0
+   sctp_make_asconf_update_ip+0xb08/0xdb0
+   sctp_send_asconf_add_ip+0x85f/0xad0
+   sctp_setsockopt+0x778/0xed0
+   __x64_sys_setsockopt+0x13f/0x180
+
+The endpoint and association bind lists have to disagree for the
+del_pending branch to be armed: sctp_bindx_rem() requires the endpoint to
+hold at least two addresses, while the branch requires the association to
+hold exactly the one being removed.  Address scoping provides that -
+sctp_in_scope() only copies an endpoint address into a new association
+when addr_scope <= peer_scope, so associating with a global-scope peer
+leaves private IPv4 addresses on the endpoint but out of the association.
+The result is reachable by an unprivileged process in a user+net
+namespace using only setsockopt(SCTP_SOCKOPT_BINDX_REM/ADD).
+
+Derive the reservation from the pending address itself.
+
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index e25612e9d082..e96844b5a56d 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -2850,7 +2850,7 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
+ 					      struct sockaddr *addrs,
+ 					      int addrcnt, __be16 flags)
+ {
+-	union sctp_addr_param addr_param;
++	union sctp_addr_param addr_param, del_addr_param;
+ 	struct sctp_addip_param	param;
+ 	int paramlen = sizeof(param);
+ 	struct sctp_chunk *retval;
+@@ -2858,7 +2858,7 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
+ 	union sctp_addr *addr;
+ 	int totallen = 0, i;
+ 	int del_pickup = 0;
+-	struct sctp_af *af;
++	struct sctp_af *af, *del_af;
+ 	void *addr_buf;
+ 
+ 	/* Get total length of all the address parameters. */
+@@ -2873,9 +2873,23 @@ struct sctp_chunk *sctp_make_asconf_update_ip(struct sctp_association *asoc,
+ 
+ 		addr_buf += af->sockaddr_len;
+ 		if (asoc->asconf_addr_del_pending && !del_pickup) {
+-			/* reuse the parameter length from the same scope one */
++			/* The pending delete address is not necessarily of the
++			 * same family as the addresses being added, so its
++			 * address parameter length must be derived from the
++			 * pending address itself.  Reusing addr_param_len here
++			 * under-reserves the chunk by 12 bytes whenever a v6
++			 * delete is picked up alongside v4 additions, and the
++			 * fill pass below then writes past the reservation.
++			 */
++			del_af = sctp_get_af_specific(
++				asoc->asconf_addr_del_pending->v4.sin_family);
++			if (!del_af)
++				return NULL;
++
+ 			totallen += paramlen;
+-			totallen += addr_param_len;
++			totallen += del_af->to_addr_param(
++					asoc->asconf_addr_del_pending,
++					&del_addr_param);
+ 			del_pickup = 1;
+ 
+ 			pr_debug("%s: picked same-scope del_pending addr, "
