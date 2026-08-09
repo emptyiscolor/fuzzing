@@ -2,11 +2,32 @@
 mount -t proc none /proc
 mount -t sysfs none /sys
 mount -t devtmpfs none /dev 2>/dev/null
+# failslab / fault injection knobs live here (CONFIG_FAULT_INJECTION_DEBUG_FS=y)
+mount -t debugfs none /sys/kernel/debug 2>/dev/null
+
+# Make KASAN reports as useful as possible and never let a report scroll away.
+echo 1 > /proc/sys/kernel/panic_on_warn 2>/dev/null
+echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null
 
 echo ""
 echo "=== kernel audit rootfs ==="
-uname -a
+uname -r
 echo "==========================="
-echo ""
+
+# Auto-run mode: `repro=1` on the kernel cmdline runs /repro unattended and
+# powers off, so verify.sh can drive a whole boot->run->collect cycle headless.
+if grep -q 'repro=1' /proc/cmdline 2>/dev/null && [ -x /repro ]; then
+        echo "REPRO_START"
+        /repro
+        echo "REPRO_EXIT=$?"
+        # Let any deferred KASAN report (RCU callback, delayed free) surface
+        # before we tear the machine down.
+        sync
+        sleep 3
+        echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+        sleep 2
+        echo "REPRO_DONE"
+        poweroff -f
+fi
 
 exec /bin/sh

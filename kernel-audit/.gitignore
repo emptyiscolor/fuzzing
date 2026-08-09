@@ -5,3 +5,5 @@ linux/
 # Generated build artifacts
 rootfs/initramfs.cpio.gz
 rootfs/initramfs/bin/
+# Compiled reproducer injected by verify.sh (rebuilt from repro/*.c each run)
+rootfs/initramfs/repro
