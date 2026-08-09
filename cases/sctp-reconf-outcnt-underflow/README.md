@@ -99,6 +99,13 @@ Present at `origin/master` `b643e495ae92`. No fix merged. Found during this
 audit after four independent static passes over `net/sctp` had otherwise gone
 dry; it was recorded as candidate C7 and then verified.
 
+## Fix validation
+
+With `reproducer/0001-*.patch` applied and the kernel rebuilt, the userspace peer
+still completes the handshake and injects the two same-seq responses, and the
+socket closes cleanly with no report — it previously took a
+`KASAN: null-ptr-deref` in `sctp_stream_free_ext` on close.
+
 ## Files
 
 - `reproducer/sctp-reconf-outcnt-underflow.c` — PoC with the userspace peer

@@ -41,6 +41,12 @@ ASCONF bugs, whose fixes are already in the tree:
 This one is in the ASCONF **builder** on the `setsockopt` path, a different
 function and a different mechanism.
 
+## Fix validation
+
+With `reproducer/0001-*.patch` applied and the kernel rebuilt, the reproducer
+completes the full n=1..24 sweep with every `trigger rc=0` and no report — it
+previously died at n=21 with `skb_over_panic`.
+
 ## Files
 
 - `reproducer/sctp-asconf-oob.c` — PoC, sweeps n=1..24 in one boot

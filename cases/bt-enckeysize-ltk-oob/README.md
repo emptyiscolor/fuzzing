@@ -43,6 +43,12 @@ So: **not a duplicate report**, but directly adjacent to a merged fix, and it
 should be reported as completing that fix rather than as an independent bug.
 The proposed patch carries `Fixes: c82b6357a546`.
 
+## Fix validation
+
+With `reproducer/0001-*.patch` applied and the kernel rebuilt, the reproducer
+still drives the whole sequence — LE Connection Complete, the unsolicited
+`key_size = 255` Command Complete, and the LTK Request — and produces no report.
+
 ## Files
 
 - `reproducer/bt-enckeysize-oob.c` — PoC (emulates enough of a controller over

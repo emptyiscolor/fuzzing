@@ -39,6 +39,12 @@ bytes would land in adjacent stack slots rather than on the canary. That was
 wrong — `CONFIG_STACKPROTECTOR_STRONG` catches it directly, on the same kernel
 used for the other two cases.
 
+## Fix validation
+
+With `reproducer/0001-*.patch` applied and the kernel rebuilt, the reproducer
+still reaches step 4 (the ARM and the TRIGGER) and produces no report — it
+previously panicked the stack protector there.
+
 ## Files
 
 - `reproducer/bt-scanrsp-stackoob.c` — PoC

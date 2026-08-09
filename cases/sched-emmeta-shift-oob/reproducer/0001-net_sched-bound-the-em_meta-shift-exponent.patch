@@ -1,0 +1,66 @@
+From: Kernel audit <littleddfu@gmail.com>
+Subject: [PATCH] net/sched: em_meta: bound the shift exponent for integer metadata
+
+meta_int_apply_extras() shifts an unsigned long by a value taken verbatim
+from userspace:
+
+	static void meta_int_apply_extras(struct meta_value *v,
+					  struct meta_obj *dst)
+	{
+		if (v->hdr.shift)
+			dst->value >>= v->hdr.shift;
+
+v->hdr is a copy of the user-supplied struct tcf_meta_val, whose shift
+field is a __u8, so it ranges over 0..255.  em_meta_change() validates
+only TCF_META_TYPE() and TCF_META_ID() and that the id has a ->get; the
+shift is never bounded, here or anywhere else.  The variable-length
+sibling meta_var_apply_extras() *is* guarded with shift < dst->len, so
+only the integer path is affected.
+
+Shifting an unsigned long by BITS_PER_LONG or more is undefined:
+
+  UBSAN: shift-out-of-bounds in net/sched/em_meta.c:766:14
+  shift exponent 255 is too large for 64-bit type 'long unsigned int'
+  Call Trace:
+   __ubsan_handle_shift_out_of_bounds+0x2d4/0x2f0
+   meta_int_apply_extras+0xf0/0x100
+   meta_get+0x144/0x330
+   em_meta_match+0x84/0x1c0
+   __tcf_em_tree_match+0x15e/0x540
+   basic_classify+0xed/0x220
+   tcf_classify+0x31c/0x4d0
+   prio_enqueue+0x146/0x4e0
+   __dev_queue_xmit+0xeed/0x23d0
+
+reached by attaching a cls_basic filter carrying an em_meta ematch with
+shift = 255 and then transmitting through the qdisc.  An unprivileged
+process can do this inside a user+net namespace.
+
+Note this is undefined behaviour rather than memory corruption: on x86
+the shift count is masked to 63, so the result is a wrong value, not an
+out-of-bounds access.
+
+Reject an out-of-range shift when the ematch is configured, so the filter
+is refused with -EINVAL instead of producing UB on every packet.
+
+diff --git a/net/sched/em_meta.c b/net/sched/em_meta.c
+index 48bdd77df0a3..52a108257766 100644
+--- a/net/sched/em_meta.c
++++ b/net/sched/em_meta.c
+@@ -927,6 +927,16 @@ static int em_meta_change(struct net *net, void *data, int len,
+ 	    TCF_META_ID(hdr->right.kind) > TCF_META_ID_MAX)
+ 		goto errout;
+ 
++	/* For integer metadata the shift is applied to an unsigned long in
++	 * meta_int_apply_extras(), so anything from BITS_PER_LONG upwards is
++	 * undefined.  The variable-length variant is already bounded against
++	 * the value length in meta_var_apply_extras(); only this side is not.
++	 */
++	if (TCF_META_TYPE(hdr->left.kind) == TCF_META_TYPE_INT &&
++	    (hdr->left.shift >= BITS_PER_LONG ||
++	     hdr->right.shift >= BITS_PER_LONG))
++		goto errout;
++
+ 	meta = kzalloc_obj(*meta);
+ 	if (meta == NULL) {
+ 		err = -ENOMEM;
