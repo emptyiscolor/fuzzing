@@ -75,8 +75,18 @@ shows no fix.
 
 ## Fix validation
 
-With `reproducer/0001-*.patch` applied, the filter is refused at configuration
-time with `-EINVAL` and no UBSAN report is produced.
+With `reproducer/0001-*.patch` applied and the kernel rebuilt, the filter is
+refused at configuration time:
+
+```
+[repro] RTM_NEWTFILTER basic+em_meta(shift=255) -> -22 (Invalid argument)
+```
+
+and no UBSAN report follows. Note the reproducer then prints a guess that
+`CONFIG_NET_EMATCH_META` may be missing — that heuristic is wrong here. The
+kernel under test has `CONFIG_NET_EMATCH_META=y` and `CONFIG_UBSAN_SHIFT=y`, and
+the *identical* filter was accepted (`rc=0`) by the same configuration before
+the patch. The `-EINVAL` is the fix rejecting the out-of-range shift.
 
 ## Files
 
