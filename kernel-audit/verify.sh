@@ -52,7 +52,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
 
 # A memory-safety hit. Deliberately does NOT match plain "WARNING" or
 # lockdep splats -- we only care about OOB/overflow/UAF here.
-PATTERN='BUG: KASAN:|kernel BUG at |general protection fault|Oops: |UBSAN: [a-z-]*out-of-bounds|stack smashing|__stack_chk_fail'
+PATTERN='BUG: KASAN:|kernel BUG at |general protection fault|Oops: |UBSAN: [a-z-]*out-of-bounds|stack smashing|__stack_chk_fail|null-ptr-deref|Unable to handle kernel NULL pointer|stack-protector: Kernel stack is corrupted'
 
 echo
 if grep -qE "$PATTERN" "$LOG"; then

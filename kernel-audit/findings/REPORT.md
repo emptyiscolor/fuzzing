@@ -250,6 +250,123 @@ the same unbounded write reaches that field; any fix should cover both.
 
 ---
 
+## 3. VERIFIED — Bluetooth: `eir_create_scan_rsp()` stack overflow via stale `scan_rsp_len`
+
+**File:** `net/bluetooth/eir.c:370-375` (unsized write), destination allocated at
+`net/bluetooth/hci_sync.c:1528`; enabled by `net/bluetooth/hci_core.c:1699`
+(flags replaced) and `:1771-1775` (length not reset).
+**Class:** stack buffer overflow — 4 bytes past a 251-byte on-stack array.
+**Impact:** kernel panic (stack-protector). The overwritten bytes are
+attacker-influenced advertising data.
+
+### Defect
+
+`eir_create_scan_rsp()` takes **no size parameter**, unlike its sibling
+`eir_create_adv_data(struct hci_dev *hdev, u8 instance, u8 *ptr, u8 size)`:
+
+```c
+u8 eir_create_scan_rsp(struct hci_dev *hdev, u8 instance, u8 *ptr)
+{
+        ...
+        if ((adv->flags & MGMT_ADV_FLAG_APPEARANCE) && hdev->appearance)
+                scan_rsp_len = eir_append_appearance(hdev, ptr, scan_rsp_len);   /* +4 */
+
+        memcpy(&ptr[scan_rsp_len], adv->scan_rsp_data, adv->scan_rsp_len);
+```
+
+The destination is a 251-byte flexible array on the **stack**:
+
+```c
+DEFINE_FLEX(struct hci_cp_le_set_ext_scan_rsp_data, pdu, data, length,
+            HCI_MAX_EXT_AD_LENGTH);        /* HCI_MAX_EXT_AD_LENGTH == 251 */
+...
+len = eir_create_scan_rsp(hdev, instance, pdu->data);
+```
+
+so `4 + 251 = 255` bytes are written into `data[251]`.
+
+### Why the validator does not prevent it
+
+That combination is supposed to be unreachable: `tlv_data_max_len()` subtracts 4
+for `MGMT_ADV_FLAG_APPEARANCE`, so a 251-byte scan response only passes
+`tlv_data_is_valid()` while that flag is **clear**. The bypass is that the flag
+and the length are set by different commands, and only one of them is reset:
+
+```c
+/* hci_add_adv_instance(), on an EXISTING instance */
+memset(adv->scan_rsp_data, 0, sizeof(adv->scan_rsp_data));   /* clears the DATA */
+...
+adv->flags = flags;                                          /* replaces the FLAGS */
+
+/* hci_set_adv_instance_data() */
+if (scan_rsp_len && SCAN_RSP_CMP(adv, scan_rsp_data, scan_rsp_len)) {
+        ...
+        adv->scan_rsp_len = scan_rsp_len;    /* assigned ONLY when non-zero */
+}
+```
+
+`MGMT_OP_ADD_EXT_ADV_PARAMS` passes `scan_rsp_len = 0`, so re-issuing it for an
+existing instance swaps in a new `flags` value while the previously validated
+length survives. `adv->scan_rsp_len` is assigned in exactly one place in the
+file, so it can never return to 0.
+
+This is the same shape as finding 2: **a validator runs once at set time and a
+later unvalidated write invalidates its conclusion.** Finding 3 was found by
+generalizing that shape rather than by auditing fresh code.
+
+### Reachability
+
+Local only, no remote peer: `/dev/vhci` plus the mgmt channel, `CAP_NET_ADMIN`.
+The emulated controller must advertise `HCI_LE_EXT_ADV` in
+`le_features[1]` (so `ext_adv_capable()` holds and `max_adv_len()` is 251) and a
+non-zero `LE Read Number of Supported Advertising Sets`. Sequence:
+
+1. `MGMT_OP_SET_POWERED`, `MGMT_OP_SET_LE`, `MGMT_OP_SET_APPEARANCE` (non-zero)
+2. `ADD_EXT_ADV_PARAMS` instance 1, `flags = 0`
+3. `ADD_EXT_ADV_DATA` instance 1, `scan_rsp_len = 251`  → validates, stores 251
+4. `ADD_EXT_ADV_PARAMS` instance 1, `flags = MGMT_ADV_FLAG_APPEARANCE`  ← arms
+5. `ADD_EXT_ADV_DATA` instance 1, `scan_rsp_len = 0`  ← triggers the sync
+
+### Evidence
+
+`findings/evidence/bt-scanrsp-stackoob-crash.log`
+
+```
+Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in:
+    hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0
+Workqueue: hci0 hci_cmd_sync_work
+Call Trace:
+ __stack_chk_fail+0x26/0x30
+ hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0
+ add_ext_adv_data_sync+0xaf/0x140
+ hci_cmd_sync_work+0x222/0x2f0
+```
+
+**Prediction that was wrong, recorded:** this was expected to require
+`CONFIG_KASAN_STACK=y`, on the assumption that 4 bytes would land in adjacent
+stack slots rather than on the canary. It does not —
+`CONFIG_STACKPROTECTOR_STRONG` catches it directly on the same kernel used for
+findings 1 and 2. (A `KASAN_STACK` rebuild was attempted and failed for an
+unrelated reason: `-Werror` plus a frame-size warning in `lib/maple_tree.c`. The
+config was restored to match the kernel that produced all three results.)
+
+### Negative control
+
+`repro/bt-scanrsp-control.c` runs the identical sequence — same 251-byte scan
+response, same trigger — with only step 4 (the flag re-issue) removed. It
+completes clean (`REPRO_EXIT=0`, no report), which attributes the panic to the
+flags/length desynchronisation rather than to the long scan response itself.
+
+### Suggested fix
+
+Give `eir_create_scan_rsp()` a `size` parameter like its sibling and bound the
+copy, and/or reset `adv->scan_rsp_len` when the instance's data is cleared in
+`hci_add_adv_instance()`. Re-validating the stored length against
+`tlv_data_max_len(hdev, new_flags, false)` whenever `adv->flags` changes would
+close the whole class.
+
+---
+
 ## Unverified candidates
 
 These are real code defects confirmed by inspection, but **not** verifiable with
@@ -281,6 +398,60 @@ KASAN-incompatible build.
 Enabled by C1's missing constraint, a non-4-aligned `ERR_CAUSE` desynchronises
 the two walks. Same slab-internal read limitation as C1.
 
+### C7 — SCTP: `stream->outcnt` u16 underflow via a replayed RECONF response
+
+`net/sctp/stream.c:1050` (`number = stream->outcnt - nums;`, both `__u16`, no
+floor) committed at `:1060`. Sinks: `sctp_stream_free()` `:189`,
+`sctp_stream_clear()` `:199` (write), and the
+`sinfo_stream >= asoc->stream.outcnt` gate in `sctp_sendmsg_to_asoc()`.
+
+`sctp_process_strreset_resp()` resolves a response via
+`sctp_chunk_lookup_strreset_param()`, which matches purely on
+`request_seq == response_seq` inside our own still-held `asoc->strreset_chunk`,
+with **no record of which request sequence numbers have already been answered**.
+When the local side requested both ADD_OUT and ADD_IN, `strreset_outstanding`
+is 2 and the chunk is retained, so two responses both carrying the ADD_OUT
+sequence number resolve to the same parameter and the subtraction runs twice
+against an already-rolled-back `outcnt`.
+
+**Not attempted, and note the detectability nuance:** `SCTP_SO()` is
+`genradix_ptr()`, which returns **NULL** for an index whose node was never
+preallocated rather than walking off an allocation. So the observable failure is
+a NULL-pointer deref, not a slab OOB. That is a real memory-safety failure but
+it would have been **missed by this audit's original detection pattern**, which
+only matched KASAN/UBSAN/BUG headers — the pattern has since been widened to
+include `null-ptr-deref`. Worth pursuing next; the reproducer needs raw
+injection of a RECONF chunk with the negotiated verification tag.
+
+### C6 — Bluetooth: deterministic UAF of `smp->ltk` via `load_long_term_keys`
+
+`net/bluetooth/mgmt.c:7370` (`hci_smp_ltks_clear`) → sinks at
+`net/bluetooth/smp.c:1068` (1-byte UAF write, then a 6-byte `bacpy`) and
+`:753` (UAF read plus a second `kfree_rcu`). IRK twin at `mgmt.c:7286` →
+`smp.c:1036`.
+
+`struct smp_chan` caches raw pointers (`smp->ltk`, `smp->responder_ltk`) into
+list-owned `smp_ltk` objects. `MGMT_OP_LOAD_LONG_TERM_KEYS` calls
+`hci_smp_ltks_clear()`, which `list_del_rcu` + `kfree_rcu`s every key without
+notifying a live SMP session. Deterministic, not a race: both sides are
+serialized under `hdev->lock` and ordered purely by userspace.
+
+The strongest evidence that this is an oversight is that the correct guard
+already exists on a neighbouring path — `smp_cancel_and_remove_pairing()`
+explicitly NULLs `smp->ltk`, `smp->responder_ltk` and `smp->remote_irk` before
+teardown, with the comment *"Set keys to NULL to make sure smp_failure() does
+not try to remove and free already invalidated rcu list entries."*
+`load_long_term_keys()` performs the identical invalidation without that step.
+
+**Not attempted** (rather than unverifiable): reaching `smp->ltk` requires an
+established encrypted LE link, because `smp_allow_key_dist()` is only called
+from `smp_distribute_keys()` and the `allow_cmd` bitmask enforces the phase
+order strictly. A reproducer therefore has to drive full Just-Works legacy
+pairing over injected L2CAP frames, including a valid `c1()` Pairing Confirm —
+i.e. implement AES-128 in userspace. This was deprioritised in favour of
+finding 3, whose reproducer is six mgmt commands. It is the most promising
+remaining lead.
+
 ---
 
 ## Notes on method
@@ -293,6 +464,14 @@ KASAN never fires. The classes that are actually verifiable are **writes past an
 allocation** and **use-after-free**, plus reads whose corrupted length is large
 relative to a *small* object. Both verified bugs are of that kind. Retargeting
 the search on that basis is what produced them.
+
+**Detection pattern widened twice, both times because it was too narrow.**
+Second correction: it matched only KASAN/UBSAN/BUG headers, so a NULL-pointer
+dereference — a genuine memory-safety failure, and the expected outcome of
+candidate C7 — would have been scored as a clean run. `null-ptr-deref` and the
+stack-protector panic string are now matched. All five evidence logs were
+re-scored against the widened pattern: both negative controls remain at zero
+matches, all three confirmed bugs still match on genuine reports.
 
 **Harness defect found and corrected.** The initial detection pattern matched
 the bare string `use-after-free`, which appears in the boot banner

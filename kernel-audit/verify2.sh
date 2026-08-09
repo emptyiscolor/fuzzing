@@ -46,7 +46,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
   -m 2G -smp 1 -nographic -no-reboot -nodefaults \
   -serial mon:stdio < /dev/null > "$LOG" 2>&1
 
-PATTERN='BUG: KASAN:|kernel BUG at |general protection fault|Oops: |UBSAN: [a-z-]*out-of-bounds|stack smashing|__stack_chk_fail'
+PATTERN='BUG: KASAN:|kernel BUG at |general protection fault|Oops: |UBSAN: [a-z-]*out-of-bounds|stack smashing|__stack_chk_fail|null-ptr-deref|Unable to handle kernel NULL pointer|stack-protector: Kernel stack is corrupted'
 
 echo
 if grep -qE "$PATTERN" "$LOG"; then

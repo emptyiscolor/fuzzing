@@ -36,6 +36,7 @@ over-matches would otherwise manufacture false positives.
 |---|-----|--------------------|
 | 1 | `sctp_make_asconf_update_ip()` under-reserves the ASCONF chunk | `kernel BUG at net/core/skbuff.c:214` (`skb_over_panic`) |
 | 2 | `hci_cc_read_enc_key_size()` unbounded write -> `hci_le_ltk_request_evt()` | `KASAN: slab-out-of-bounds`, read of size 255; plus `UBSAN: array-index-out-of-bounds` |
+| 3 | `eir_create_scan_rsp()` stack overflow via stale `adv->scan_rsp_len` | `stack-protector: Kernel stack is corrupted in hci_set_ext_scan_rsp_data_sync` |
 
 ## Candidates
 
@@ -150,15 +151,23 @@ over-matches would otherwise manufacture false positives.
 - **Note:** two independent sanitizers fired on the same call path, and both the
   read side (`memcpy` source) and the index side (`memset`) are flagged.
 
-### C5 — eir_create_scan_rsp: stale scan_rsp_len -> 4-byte stack OOB write
+### C5 — eir_create_scan_rsp: stale scan_rsp_len -> 4-byte stack OOB write  ✅ **VERIFIED**
 - **File:** `net/bluetooth/eir.c:370-375` (unsized write) via
   `net/bluetooth/hci_sync.c:1528,1545`; enabled by `net/bluetooth/hci_core.c:1699`
   (flags replaced) + `:1771-1775` (length not reset).
 - **Class:** OOB-write, 4 bytes past a 251-byte **stack** flex array.
-- **Status:** candidate — reproducer written (`repro/bt-scanrsp-stackoob.c`),
-  awaiting a `CONFIG_KASAN_STACK=y` kernel (rebuilding; the default config had
-  it off, and 4 bytes into adjacent stack slots will not reliably hit the
-  canary).
+- **Status:** **VERIFIED.** `stack-protector: Kernel stack is corrupted in:
+  hci_set_ext_scan_rsp_data_sync+0x3b5/0x3e0`, via `add_ext_adv_data_sync` <-
+  `hci_cmd_sync_work`. Evidence in
+  `findings/evidence/bt-scanrsp-stackoob-crash.log`.
+- **Prediction that was wrong:** I expected this to need `CONFIG_KASAN_STACK=y`.
+  It does not — `STACKPROTECTOR_STRONG` catches it on the same kernel used for
+  the other two findings. (The KASAN_STACK rebuild was attempted and failed on
+  an unrelated `-Werror` frame-size limit in `lib/maple_tree.c`; the config was
+  restored to match the kernel that produced all three results.)
+- **Negative control:** `repro/bt-scanrsp-control.c` — identical sequence minus
+  the flag re-issue — runs clean
+  (`findings/evidence/bt-scanrsp-NEGATIVE-CONTROL.log`).
 - **What:** `eir_create_scan_rsp()` takes **no size parameter**, unlike its
   sibling `eir_create_adv_data(hdev, instance, ptr, u8 size)`. It writes 4 bytes
   of appearance plus `adv->scan_rsp_len` bytes into a 251-byte
