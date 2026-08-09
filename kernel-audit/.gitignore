@@ -1,0 +1,7 @@
+# Full kernel source is its own (large, nested) git repo — cloned by hand,
+# not tracked here. See README.md "1. Update the kernel source".
+linux/
+
+# Generated build artifacts
+rootfs/initramfs.cpio.gz
+rootfs/initramfs/bin/
