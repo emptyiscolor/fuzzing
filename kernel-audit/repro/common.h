@@ -222,6 +222,50 @@ static int link_up(int nl, int ifindex)
 	return nl_send(nl, &b);
 }
 
+/* ---- address configuration ---------------------------------------------- */
+static int addr_add4(int nl, int ifindex, const char *cidr_addr, int plen)
+{
+	struct nlbuf b;
+	struct ifaddrmsg ifa = {
+		.ifa_family    = AF_INET,
+		.ifa_prefixlen = plen,
+		.ifa_scope     = 0,
+		.ifa_index     = ifindex,
+	};
+	unsigned char a[4];
+	unsigned int x0, x1, x2, x3;
+
+	if (sscanf(cidr_addr, "%u.%u.%u.%u", &x0, &x1, &x2, &x3) != 4)
+		return -EINVAL;
+	a[0] = x0; a[1] = x1; a[2] = x2; a[3] = x3;
+
+	nlb_init(&b, RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE);
+	nlb_put_hdr(&b, &ifa, sizeof(ifa));
+	nlb_put_attr(&b, IFA_LOCAL, a, 4);
+	nlb_put_attr(&b, IFA_ADDRESS, a, 4);
+	return nl_send(nl, &b);
+}
+
+/* addr16 must be 16 raw bytes. IFA_F_NODAD keeps the address out of the
+ * tentative state, which would otherwise make it unusable for a second. */
+static int addr_add6(int nl, int ifindex, const unsigned char addr16[16], int plen)
+{
+	struct nlbuf b;
+	struct ifaddrmsg ifa = {
+		.ifa_family    = AF_INET6,
+		.ifa_prefixlen = plen,
+		.ifa_flags     = 0x20 /* IFA_F_NODAD */,
+		.ifa_scope     = 0,
+		.ifa_index     = ifindex,
+	};
+
+	nlb_init(&b, RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE);
+	nlb_put_hdr(&b, &ifa, sizeof(ifa));
+	nlb_put_attr(&b, IFA_LOCAL, addr16, 16);
+	nlb_put_attr(&b, IFA_ADDRESS, addr16, 16);
+	return nl_send(nl, &b);
+}
+
 /* ---- fault injection ----------------------------------------------------
  * Error paths guarded only by allocation failure are where a lot of the
  * lifetime bugs live. CONFIG_FAILSLAB + debugfs lets us reach them on demand:
