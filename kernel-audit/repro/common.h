@@ -74,6 +74,23 @@ static void enter_userns(void)
 	logf("entered user+net namespace");
 }
 
+/* Netns only, deliberately WITHOUT CLONE_NEWUSER.
+ *
+ * Use this when the reproducer needs fault injection. proc_fault_inject_write()
+ * gates /proc/<pid>/make-it-fail on capable(CAP_SYS_RESOURCE), which is checked
+ * against the INIT user namespace -- so entering a user namespace silently
+ * costs you the ability to arm failslab, and every injection attempt returns
+ * -EPERM while the run still looks healthy. Reproducers that want to
+ * demonstrate unprivileged reachability should use enter_userns() instead; this
+ * one trades that away to keep init-namespace capabilities.
+ */
+static void enter_netns_only(void)
+{
+	if (unshare(CLONE_NEWNET) != 0)
+		die("unshare(CLONE_NEWNET)");
+	logf("entered netns only (kept init-userns caps for fault injection)");
+}
+
 /* ---- netlink ------------------------------------------------------------ */
 static int nl_open(void)
 {

@@ -150,6 +150,59 @@ over-matches would otherwise manufacture false positives.
 - **Note:** two independent sanitizers fired on the same call path, and both the
   read side (`memcpy` source) and the index side (`memset`) are flagged.
 
+### C5 — eir_create_scan_rsp: stale scan_rsp_len -> 4-byte stack OOB write
+- **File:** `net/bluetooth/eir.c:370-375` (unsized write) via
+  `net/bluetooth/hci_sync.c:1528,1545`; enabled by `net/bluetooth/hci_core.c:1699`
+  (flags replaced) + `:1771-1775` (length not reset).
+- **Class:** OOB-write, 4 bytes past a 251-byte **stack** flex array.
+- **Status:** candidate — reproducer written (`repro/bt-scanrsp-stackoob.c`),
+  awaiting a `CONFIG_KASAN_STACK=y` kernel (rebuilding; the default config had
+  it off, and 4 bytes into adjacent stack slots will not reliably hit the
+  canary).
+- **What:** `eir_create_scan_rsp()` takes **no size parameter**, unlike its
+  sibling `eir_create_adv_data(hdev, instance, ptr, u8 size)`. It writes 4 bytes
+  of appearance plus `adv->scan_rsp_len` bytes into a 251-byte
+  `DEFINE_FLEX(...)` stack buffer.
+- **Why the validator does not stop it:** `tlv_data_max_len()` subtracts 4 when
+  `MGMT_ADV_FLAG_APPEARANCE` is set, so 251 only validates while that flag is
+  clear. The two fields are then set by different commands and only one is
+  reset: `hci_add_adv_instance()` on an existing instance memsets the scan
+  response *data* and replaces `adv->flags`, while
+  `hci_set_adv_instance_data()` assigns `adv->scan_rsp_len` **only when the new
+  length is non-zero** — and `ADD_EXT_ADV_PARAMS` passes zero. `adv->scan_rsp_len`
+  is assigned in exactly one place in the whole file, so it can never return to 0.
+- **Independently checked:** yes — read `eir_create_scan_rsp`, the `DEFINE_FLEX`
+  caller, and both `hci_core.c` sites.
+- **Same shape as verified bug C4:** a validator runs once at set time and a
+  later unvalidated write invalidates its conclusion.
+
+### C6 — load_long_term_keys / load_irks: deterministic UAF of `smp->ltk`
+- **File:** `net/bluetooth/mgmt.c:7370` (`hci_smp_ltks_clear`) → sinks at
+  `net/bluetooth/smp.c:1068` and `:753`; IRK twin at `mgmt.c:7286` → `smp.c:1036`.
+- **Class:** slab use-after-free (1-byte write, then 6-byte `bacpy` write) and
+  double `kfree_rcu`.
+- **Status:** candidate, high confidence, **not attempted** — see cost note.
+- **What:** `struct smp_chan` caches raw pointers (`smp->ltk`,
+  `smp->responder_ltk`) to list-owned `smp_ltk` objects.
+  `MGMT_OP_LOAD_LONG_TERM_KEYS` calls `hci_smp_ltks_clear()`, which
+  `list_del_rcu` + `kfree_rcu`s every key with no notification to a live SMP
+  session. `smp_notify_keys()` then does `smp->ltk->bdaddr_type = ...`.
+- **Strongest evidence it is an oversight:** the correct guard exists elsewhere.
+  `smp_cancel_and_remove_pairing()` explicitly NULLs `smp->ltk`,
+  `smp->responder_ltk` and `smp->remote_irk` before teardown, with the comment
+  *"Set keys to NULL to make sure smp_failure() does not try to remove and free
+  already invalidated rcu list entries."* `load_long_term_keys()` performs the
+  identical invalidation without that step.
+- **Deterministic, not a race:** both sides are serialized under `hdev->lock`
+  and ordered purely by userspace.
+- **Cost note (why not attempted):** reaching `smp->ltk` requires an established
+  encrypted LE link — `smp_allow_key_dist()` is only called from
+  `smp_distribute_keys()`, and the `allow_cmd` bitmask enforces the phase order
+  strictly. That means driving full Just-Works legacy pairing over injected
+  L2CAP frames, including a valid `c1()` Pairing Confirm, i.e. implementing
+  AES-128 in the reproducer. Deferred in favour of C5, whose reproducer is six
+  mgmt commands.
+
 ### C2 — sctp_get_asconf_response: padded/unpadded walk desync
 - **File:** `net/sctp/sm_make_chunk.c:3459-3461`
 - **Class:** OOB-read (bounded ~4 bytes past chunk end).
