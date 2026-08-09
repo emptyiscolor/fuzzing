@@ -1,0 +1,86 @@
+From: Kernel audit <littleddfu@gmail.com>
+Subject: [PATCH] sctp: do not roll back stream->outcnt on a replayed reconf response
+
+sctp_process_strreset_resp() resolves an incoming Re-configuration Response
+with sctp_chunk_lookup_strreset_param(), which walks the parameters of our
+own retained asoc->strreset_chunk and returns the first whose request_seq
+matches the response's response_seq.  It keeps no record of which request
+sequence numbers have already been answered, and the request chunk is only
+released once asoc->strreset_outstanding reaches zero:
+
+	asoc->strreset_outstanding--;
+	asoc->strreset_outseq++;
+	if (!asoc->strreset_outstanding) {
+		...
+		sctp_chunk_put(asoc->strreset_chunk);
+		asoc->strreset_chunk = NULL;
+	}
+
+sctp_make_strreset_addstrm() emits the add-out and add-in parameters with
+request_seq S and S+1 and leaves strreset_outstanding at 2, so a peer that
+answers twice with response_seq S has both responses resolve to the same
+add-out parameter.  The add-out handler then computes
+
+	nums   = ntohs(addstrm->number_of_streams);
+	number = stream->outcnt - nums;
+
+with both operands __u16.  The first response rolls stream->outcnt back
+correctly; the second subtracts the same count from the already
+rolled-back value and wraps.  With 10 outbound streams and an add of 100,
+outcnt goes 10 -> 110 at request time, back to 10, and then to 65446.
+
+stream->outcnt is a loop bound and an index gate.  SCTP_SO() is
+genradix_ptr(), which returns NULL for an index whose node was never
+allocated, so sctp_stream_free() walks off the end of the populated
+genradix on teardown:
+
+  Oops: general protection fault, probably for non-canonical address
+        0xdffffc0000000001
+  KASAN: null-ptr-deref in range [0x0000000000000008-0x000000000000000f]
+  RIP: 0010:sctp_stream_free_ext+0x61/0x120
+  Call Trace:
+   sctp_stream_free+0x6f/0xd0
+   sctp_association_free+0x21c/0x660
+   sctp_do_sm+0x1edb/0x4720
+   sctp_primitive_ABORT+0x8a/0xc0
+   sctp_close+0x17e/0x600
+   __x64_sys_close+0x7b/0xc0
+
+sctp_stream_clear() and the sinfo_stream bound in sctp_sendmsg_to_asoc()
+are affected the same way.
+
+Only apply the rollback when the subtraction is valid.  Note the
+SCTP_STRRESET_PERFORMED arm is already safe: its loop starts at the
+wrapped value, which is greater than outcnt, so it simply does not run.
+
+A deeper fix would be to reject a response whose response_seq is not the
+one asoc->strreset_outseq expects, making every response single use.  That
+changes which responses are accepted on the wire, so it is left out here.
+
+diff --git a/net/sctp/stream.c b/net/sctp/stream.c
+index 34ffe6c945a4..33038012b65d 100644
+--- a/net/sctp/stream.c
++++ b/net/sctp/stream.c
+@@ -1052,7 +1052,21 @@ struct sctp_chunk *sctp_process_strreset_resp(
+ 		if (result == SCTP_STRRESET_PERFORMED) {
+ 			for (i = number; i < stream->outcnt; i++)
+ 				SCTP_SO(stream, i)->state = SCTP_STREAM_OPEN;
+-		} else {
++		} else if (nums <= stream->outcnt) {
++			/* Only roll back when the subtraction is valid.
++			 *
++			 * sctp_chunk_lookup_strreset_param() resolves a
++			 * response by request_seq alone and keeps no record of
++			 * which requests have already been answered, while the
++			 * request chunk is retained until strreset_outstanding
++			 * reaches zero.  A peer that sends two responses
++			 * carrying the same response_seq therefore resolves the
++			 * same add-out request twice, and the second
++			 * subtraction runs against an outcnt that has already
++			 * been rolled back - wrapping the u16 and leaving
++			 * stream->outcnt far beyond the number of allocated
++			 * stream slots.
++			 */
+ 			sched = sctp_sched_ops_from_stream(stream);
+ 			sched->unsched_all(stream);
+ 			sctp_stream_outq_migrate(stream, NULL, number);

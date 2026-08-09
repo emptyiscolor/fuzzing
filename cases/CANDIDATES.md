@@ -6,84 +6,12 @@ that the defect is real.
 
 ---
 
-## C7 — sctp: `stream->outcnt` u16 underflow via a replayed RECONF response
+## C7 — VERIFIED, moved out of this file
 
-**Site:** `net/sctp/stream.c:1050`, committed at `:1060`
-**Class:** integer underflow on long-lived state → out-of-range stream count
-**Confidence:** high that the defect is real; medium on exploit impact
-
-```c
-__u16 number;
-nums   = ntohs(addstrm->number_of_streams);
-number = stream->outcnt - nums;          /* no floor */
-...
-} else {                                  /* result != PERFORMED */
-        sctp_stream_outq_migrate(stream, NULL, number);
-        stream->outcnt = number;
-}
-```
-
-`stream->outcnt` and `number` are both `__u16`.
-
-**Why a response can be applied twice — confirmed by reading the code directly:**
-`sctp_process_strreset_resp()` resolves a response through
-`sctp_chunk_lookup_strreset_param()`, which walks the params of our own retained
-`asoc->strreset_chunk` and returns the **first** whose `request_seq` matches the
-response's `response_seq`. It keeps **no record of which request sequence numbers
-have already been answered**. The chunk itself is only released once
-`asoc->strreset_outstanding` reaches 0:
-
-```c
-asoc->strreset_outstanding--;
-asoc->strreset_outseq++;
-if (!asoc->strreset_outstanding) {
-        ...
-        sctp_chunk_put(asoc->strreset_chunk);
-        asoc->strreset_chunk = NULL;
-}
-```
-
-So when the local side requested **both** ADD_OUT and ADD_IN,
-`sctp_make_strreset_addstrm()` emits two params with `request_seq = S` and
-`S+1` and `strreset_outstanding == 2`. Two responses both carrying
-`response_seq = S` therefore both resolve to the **same ADD_OUT param**, and the
-subtraction at `:1050` runs twice against an already-rolled-back `outcnt`.
-`sctp_verify_reconf()` explicitly permits RESET_RESPONSE to follow
-RESET_RESPONSE, and `sctp_sf_do_reconf()` processes every param in the chunk, so
-both can arrive in a single injected chunk.
-
-Concretely with `sinit_num_ostreams = 10` and `SCTP_ADD_STREAMS` of 100:
-outcnt 10 → 110 at request time; first DENIED response rolls it back to 10;
-second DENIED response computes `10 - 100` → **65446**.
-
-The `SCTP_STRRESET_PERFORMED` branch is harmless on underflow — the bug needs
-`result` to be neither PERFORMED nor IN_PROGRESS (e.g. `DENIED == 3`), which is a
-peer-chosen 32-bit field. `sctp_stream_outq_migrate(stream, NULL, 65446)` is a
-no-op for the underflowed value, so nothing catches it before the commit.
-
-**Sinks:** `sctp_stream_free()` `:189` (loop to `outcnt`, dereferences
-`SCTP_SO(stream, i)->ext`), `sctp_stream_clear()` `:199` (write), and the
-`sinfo_stream >= asoc->stream.outcnt` gate in `sctp_sendmsg_to_asoc()`, which
-would then admit stream ids up to 65445.
-
-**Detectability nuance — this matters:** `SCTP_SO()` is `genradix_ptr()`, which
-returns **NULL** for an index whose node was never preallocated rather than
-walking off an allocation. The observable failure is therefore a NULL-pointer
-dereference, not a slab OOB. The audit's original detection pattern would have
-scored that as a clean run; it has since been widened to match `null-ptr-deref`.
-
-**Why it was not verified.** Reaching the double-resolve needs the victim to have
-two outstanding reconf requests *and* to receive two crafted responses before a
-legitimate one arrives. A real kernel peer answers immediately over loopback and
-clears the state, so a reproducer needs a **userspace SCTP peer**: CRC32c
-checksumming, an INIT / INIT-ACK / COOKIE-ECHO / COOKIE-ACK handshake with a
-SUPPORTED_EXT param advertising RECONF, plus veth and a static neighbour entry so
-the peer address is not local (otherwise the host stack ABORTs the INIT itself).
-That is roughly 400-500 lines and was out of budget. It is the best remaining
-lead in `net/sctp`.
-
-**Minimal fix shape:** reject a response whose `request_seq` has already been
-consumed, or clamp with `if (nums > stream->outcnt) break;` before line 1050.
+The sctp `stream->outcnt` underflow was reproduced and now lives in
+`cases/sctp-reconf-outcnt-underflow/`, with a userspace SCTP peer as the
+reproducer and a negative control. Left as a pointer here so the numbering
+in earlier notes still resolves.
 
 ---
 

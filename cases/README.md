@@ -15,12 +15,13 @@ re-checked against `origin/master` `b643e495ae92`.
 | `sctp-asconf-delpending-oob` | OOB write, 12 bytes past an skb | `kernel BUG` / `skb_over_panic` | **unique** — unfixed at `b643e495ae92` |
 | `bt-enckeysize-ltk-oob` | OOB slab read + stack write + `memset` size underflow | `KASAN: slab-out-of-bounds` + `UBSAN` | **incomplete fix** of `b8dbe9648d69` — second path to the same sink, still open |
 | `bt-scanrsp-stack-oob` | 4-byte stack OOB write | `stack-protector: Kernel stack is corrupted` | **unique** — unfixed at `b643e495ae92` |
+| `sctp-reconf-outcnt-underflow` | u16 underflow of a stream count → NULL deref | `KASAN: null-ptr-deref` in `sctp_stream_free_ext` | **unique** — unfixed at `b643e495ae92` |
 
 ## How the duplicate check was done, and its limits
 
 **Authoritative half (git).** The clone was unshallowed and `origin/master`
 re-fetched. The 6 commits merged since the audit HEAD are all s390/zcrypt and
-touch no networking file. The defective code for all three findings is present
+touch no networking file. The defective code for all four findings is present
 verbatim at `b643e495ae92`, so **no fix for any of them has been merged**.
 Related history was checked too: the tree already contains
 `9de7922bc709` (CVE-2014-3673, ASCONF receive-path `skb_over_panic`),
