@@ -19,6 +19,24 @@ findings; KMSAN needs a separate, KASAN-incompatible build.
 
 ---
 
+## Harness correction (recorded because it affected a verdict)
+
+The first detection pattern matched the bare string `use-after-free`, which
+appears in the **boot banner** `rcu: RCU callback double-/use-after-free debug
+is enabled.` That made the SCTP negative control report "REPRODUCED" when it had
+in fact run clean. Fixed to match real report headers only (`BUG: KASAN:`,
+`kernel BUG at `, `UBSAN: *-out-of-bounds`, ...). Both confirmed bugs were
+re-checked against the corrected pattern and still match on genuine reports; the
+control re-evaluates to 0 matches. Logged here because a detector that
+over-matches would otherwise manufacture false positives.
+
+## Verified bugs
+
+| # | Bug | Sanitizer evidence |
+|---|-----|--------------------|
+| 1 | `sctp_make_asconf_update_ip()` under-reserves the ASCONF chunk | `kernel BUG at net/core/skbuff.c:214` (`skb_over_panic`) |
+| 2 | `hci_cc_read_enc_key_size()` unbounded write -> `hci_le_ltk_request_evt()` | `KASAN: slab-out-of-bounds`, read of size 255; plus `UBSAN: array-index-out-of-bounds` |
+
 ## Candidates
 
 ### C1 — sctp_verify_asconf: missing length check on SCTP_PARAM_ERR_CAUSE
@@ -47,7 +65,25 @@ findings; KMSAN needs a separate, KASAN-incompatible build.
 - **Verdict:** real, worth reporting upstream as a hardening fix, but does not
   count toward the goal's "verified" bar.
 
-### C3 — sctp_make_asconf_update_ip: del-pickup length accounting mismatch
+### C3 — sctp_make_asconf_update_ip: del-pickup length accounting mismatch  ✅ **VERIFIED**
+- **Reproduced:** `kernel BUG at net/core/skbuff.c:214` (`skb_over_panic`),
+  evidence in `findings/evidence/sctp-asconf-oob-crash.log`.
+- **Trace (exactly the predicted path):**
+  ```
+  skb_over_panic+0x14f  <- skb_put+0x110  <- sctp_make_asconf_update_ip+0xb08
+  <- sctp_send_asconf_add_ip+0x85f <- sctp_setsockopt+0x778
+  <- do_sock_setsockopt <- __x64_sys_setsockopt
+  ```
+- **Reached from an unprivileged user+net namespace** (`unshare(CLONE_NEWUSER|
+  CLONE_NEWNET)`), via plain `setsockopt` — no packet injection, no real root.
+- Fired at n=21 additions, not the n=9 I predicted; my slack arithmetic was off
+  on the chunk header/laddr parameter sizes. The mechanism is confirmed, the
+  size prediction was not — which is exactly why the sweep exists.
+- **Negative control:** `repro/sctp-asconf-control.c` runs the identical
+  sequence minus the arming `bindx_rem`. Required to attribute the crash to the
+  del-pickup mismatch rather than to adding N addresses per se.
+
+
 - **File:** `net/sctp/sm_make_chunk.c:2877-2878` (sizing) vs `:2908-2916` (write).
 - **Class:** OOB-write (12 bytes past the reserved chunk).
 - **Status:** **PRIMARY CANDIDATE — reproducer written, verification pending.**
@@ -79,6 +115,40 @@ findings; KMSAN needs a separate, KASAN-incompatible build.
   usable exactly 192). With L ~= 16n+44 that is **n=9** additions — which
   matches the auditing agent's independently derived estimate.
 - **Reproducer:** `repro/sctp-asconf-oob.c`, sweeps n=1..24 in one boot.
+
+### C4 — hci_cc_read_enc_key_size: unbounded enc_key_size  ✅ **VERIFIED**
+- **File:** `net/bluetooth/hci_event.c:745,769` (unbounded write) →
+  `net/bluetooth/hci_event.c:6720-6721` (sinks).
+- **Class:** OOB-read (slab, 239 bytes past a 72-byte object) + OOB-write to a
+  16-byte stack array + `memset` length underflow.
+- **Reproduced:** evidence in `findings/evidence/bt-enckeysize-oob-crash.log`.
+  ```
+  BUG: KASAN: slab-out-of-bounds in hci_le_ltk_request_evt+0x309/0xa00
+  Read of size 255 at addr ffff88800d06f558 by task kworker/u5:0/65
+    __asan_memcpy <- hci_le_ltk_request_evt <- hci_event_packet <- hci_rx_work
+  object: kmalloc-96, allocated 72-byte region, bad access 56 bytes in
+    (offset 56 == struct smp_ltk .val[16])
+  allocated by: hci_add_ltk <- load_long_term_keys <- hci_mgmt_cmd
+
+  UBSAN: array-index-out-of-bounds in net/bluetooth/hci_event.c:6721:16
+  index 255 is out of range for type '__u8[16]'
+  ```
+- **What:** `conn->enc_key_size = rp->key_size` takes a raw u8 (0..255) from a
+  Command Complete. Both subsequent checks are *downgrade* checks (`<`), so
+  nothing rejects a value above 16, and `*key_enc_size = conn->enc_key_size`
+  writes it into `ltk->enc_size`. The validators that normally bound that field
+  — `ltk_is_valid()` (mgmt) and `check_enc_key_size()` (smp) — run at key
+  *install* time, so this later write bypasses both.
+- **Why the Command Complete is accepted at all:** `hci_cmd_complete_evt`
+  selects the handler purely from the opcode carried in the event, with no
+  correlation against a command the host actually sent — so it can be injected
+  unsolicited. `hci_read_enc_key_size()` is only ever *sent* for ACL links, but
+  the *handler* re-resolves the connection from an attacker-chosen handle and
+  never re-checks `conn->type`, so an LE connection can be targeted.
+- **Reachability:** local only, no remote peer — `/dev/vhci` plus the mgmt
+  channel. The reproducer emulates enough of a controller to reach `HCI_UP`.
+- **Note:** two independent sanitizers fired on the same call path, and both the
+  read side (`memcpy` source) and the index side (`memset`) are flagged.
 
 ### C2 — sctp_get_asconf_response: padded/unpadded walk desync
 - **File:** `net/sctp/sm_make_chunk.c:3459-3461`

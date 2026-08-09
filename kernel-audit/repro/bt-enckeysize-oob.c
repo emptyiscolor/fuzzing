@@ -94,7 +94,7 @@ static void respond_cmd_complete(unsigned short opcode, const unsigned char *par
 static void responder_loop(void)
 {
 	unsigned char buf[4096];
-	unsigned char params[128];
+	unsigned char params[256];
 	int n;
 
 	for (;;) {
@@ -145,9 +145,13 @@ static void responder_loop(void)
 				respond_cmd_complete(opcode, params, 1);
 				break;
 			default:
-				/* Generic: status + 96 zero bytes satisfies min_len
-				 * for every remaining cc handler. */
-				respond_cmd_complete(opcode, params, 96);
+				/* Generic reply. It has to be long enough for the
+				 * LONGEST cc handler's min_len or init stalls:
+				 * HCI_OP_READ_LOCAL_NAME (0x0c14) wants status +
+				 * 248 name bytes. Handlers ignore trailing excess
+				 * (they only warn), so one oversized reply serves
+				 * every command. */
+				respond_cmd_complete(opcode, params, 248);
 				break;
 			}
 		}

@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/sockios.h>
+#include <signal.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/pkt_sched.h>

