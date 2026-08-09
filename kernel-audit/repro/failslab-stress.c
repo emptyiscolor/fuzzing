@@ -37,6 +37,21 @@ static const char *QDISCS[] = {
 static const char *CLS[] = { "u32", "basic", "fw", "route", "flow", "flower", "matchall" };
 #define NCLS (int)(sizeof(CLS) / sizeof(CLS[0]))
 
+/* Injection accounting. A clean stress run means nothing unless we can show
+ * allocations were actually being failed, so count the -ENOMEM returns that
+ * failslab produces. If this stays zero, the run exercised no error paths and
+ * the result is vacuous. */
+static unsigned long n_ops, n_enomem, n_othererr;
+
+static void account(int rc)
+{
+	n_ops++;
+	if (rc == -ENOMEM)
+		n_enomem++;
+	else if (rc < 0)
+		n_othererr++;
+}
+
 static void qdisc_op(int type, int flags, const char *kind, unsigned handle,
 		     unsigned parent)
 {
@@ -53,7 +68,7 @@ static void qdisc_op(int type, int flags, const char *kind, unsigned handle,
 	nlb_put_hdr(&b, &tcm, sizeof(tcm));
 	if (kind)
 		nlb_put_str(&b, TCA_KIND, kind);
-	nl_send(nl, &b);
+	account(nl_send(nl, &b));
 }
 
 static void filter_op(int type, int flags, const char *kind, unsigned parent,
@@ -72,7 +87,7 @@ static void filter_op(int type, int flags, const char *kind, unsigned parent,
 	nlb_put_hdr(&b, &tcm, sizeof(tcm));
 	if (kind)
 		nlb_put_str(&b, TCA_KIND, kind);
-	nl_send(nl, &b);
+	account(nl_send(nl, &b));
 }
 
 /* Sockets whose setup/teardown allocates, so failslab exercises their
@@ -150,13 +165,16 @@ int main(void)
 		failslab_disarm();
 
 		if ((round % 250) == 0) {
-			logf("round %d/%d", round, ROUNDS);
+			logf("round %d/%d  ops=%lu enomem=%lu othererr=%lu", round, ROUNDS, n_ops, n_enomem, n_othererr);
 			/* Give RCU a chance to actually free things, so
 			 * use-after-free has a window to be detected. */
 			usleep(50000);
 		}
 	}
 
-	logf("stress complete (%d rounds)", ROUNDS);
+	logf("stress complete (%d rounds) ops=%lu enomem=%lu othererr=%lu",
+	     ROUNDS, n_ops, n_enomem, n_othererr);
+	if (n_enomem == 0)
+		logf("VACUOUS: no allocation ever failed - fault injection was NOT active");
 	return 0;
 }
